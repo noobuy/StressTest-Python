@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+tokens.csv
+.env               # 이메일, 비번, Cognito ID 누출 방지
+.DS_Store          # 맥북 시스템 임시 파일 방지
+*.pyc
