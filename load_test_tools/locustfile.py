@@ -9,21 +9,26 @@
 #   5. 응답 시간 임계값 초과 시 자동 실패 마킹
 # ==========================================
 
+# [load_test_tools/locustfile.py]
+
 import csv
 import os
 import sys
 import time
 import logging
 from queue import Queue, Empty
+from pathlib import Path
+
+# 👇 이 줄을 추가하세요!
+logger = logging.getLogger(__name__)
+
+# ★ 수정된 부분: 현재 폴더가 아니라 부모 폴더(루트)의 config.py를 찾도록 수정
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from locust import HttpUser, task, between, tag, events
-
-# config.py에서 경로·설정 가져오기
-# (locustfile.py와 config.py가 같은 폴더에 있다고 가정)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import TOKENS_FILE, BASE_URL
-
-logger = logging.getLogger(__name__)
 
 # ==========================================
 # 1. 토큰 로딩 (Thread-safe Queue)

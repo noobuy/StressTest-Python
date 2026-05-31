@@ -13,20 +13,20 @@
 import csv
 import os
 import sys
+
+from pathlib import Path
+
+# ★ 중요: 부모 폴더(루트)에 있는 config.py를 찾을 수 있게 경로 추가
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.append(_ROOT)
+
 import time
 
 import boto3
 
-from config import (
-    BOTO_CONFIG,
-    CLIENT_ID,
-    REGION,
-    TEST_PW,
-    TOKENS_FILE,
-    USER_COUNT,
-    USER_POOL_ID,
-    USER_PREFIX,
-)
+from config import BOTO_CONFIG, CLIENT_ID, REGION, TEST_PW, TOKENS_FILE, USER_COUNT, USER_POOL_ID, USER_PREFIX
+
 
 # adaptive retry가 적용된 클라이언트
 client = boto3.client("cognito-idp", region_name=REGION, config=BOTO_CONFIG)

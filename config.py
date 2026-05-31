@@ -10,21 +10,18 @@
 
 import os
 from pathlib import Path
+from botocore.config import Config as BotoConfig
 
 # ------------------------------------------
 # 0. .env 파일 자동 로드 (있을 때만)
 # ------------------------------------------
-# pip install python-dotenv 필요
-# .env 파일이 없어도 에러 없이 넘어갑니다.
 try:
     from dotenv import load_dotenv
-    # 이 파일(config.py)과 같은 폴더, 또는 프로젝트 루트의 .env를 찾습니다.
-    _env_path = Path(__file__).resolve().parent.parent / ".env"
-    if not _env_path.exists():
-        _env_path = Path(__file__).resolve().parent / ".env"
-    load_dotenv(_env_path, override=False)
+    # config.py가 루트에 있으므로, 같은 경로의 .env를 찾습니다.
+    _env_path = Path(__file__).resolve().parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path, override=False)
 except ImportError:
-    # python-dotenv가 없으면 순수 환경 변수만 사용합니다.
     pass
 
 # ------------------------------------------
@@ -60,25 +57,20 @@ TABLE_NAME    = os.environ.get("TABLE_NAME",    "VamserlikeGame")
 PARTITION_KEY = os.environ.get("PARTITION_KEY",  "UserId")
 
 # ------------------------------------------
-# 5. 파일 경로 (어디서 실행해도 안전)
+# 5. 파일 경로 
 # ------------------------------------------
 # config.py가 위치한 디렉토리를 기준으로 tokens.csv 경로를 고정합니다.
-_SCRIPT_DIR = Path(__file__).resolve().parent
-TOKENS_FILE = _SCRIPT_DIR / "tokens.csv"
+_ROOT_DIR = Path(__file__).resolve().parent
+# 수정된 부분: tokens.csv를 무조건 load_test_tools 폴더 안에 넣습니다.
+TOKENS_FILE = _ROOT_DIR / "load_test_tools" / "tokens.csv"
 
 # ------------------------------------------
 # 6. Boto3 재시도 설정 (Cognito Throttling 방어)
 # ------------------------------------------
 # CognitoAccountConfig.py, tokens.py 등에서 공용으로 사용합니다.
 # 사용법: boto3.client('cognito-idp', region_name=REGION, config=BOTO_CONFIG)
-from botocore.config import Config as BotoConfig
 
-BOTO_CONFIG = BotoConfig(
-    retries={
-        "max_attempts": 5,
-        "mode": "adaptive",   # 지수 백오프 + 토큰 버킷 자동 적용
-    }
-)
+BOTO_CONFIG = BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"})
 
 # ------------------------------------------
 # 부팅 시 현재 설정 요약 출력 (디버깅용)

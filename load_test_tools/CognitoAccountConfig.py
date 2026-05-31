@@ -1,5 +1,5 @@
 # ==========================================
-# 👤 AWS Cognito 계정 자동화 엔진 (v2)
+# 👤 AWS Cognito 계정 자동화 엔진 (v2.1)
 # ==========================================
 # 개선 사항:
 #   1. BOTO_CONFIG 적용 (adaptive retry → Throttling 자동 방어)
@@ -7,23 +7,22 @@
 #   3. 삭제 시 list_users Limit 상향 (60 → 최대치)으로 속도 개선
 #   4. 생성 결과 요약 리포트 (성공/스킵/실패 카운트)
 #   5. 삭제 전 대상 수 미리 표시하여 안전성 확보
-#   6. sleep 간격을 BOTO_CONFIG의 adaptive retry에 위임
+#   6. 이메일 인증 스킵 여부 선택 기능 추가 (기본: 스킵)
 # ==========================================
 
 import sys
+from pathlib import Path
+
+# ★ 중요: 부모 폴더(루트)에 있는 config.py를 찾을 수 있게 경로 추가
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.append(_ROOT)
+
 import time
 
 import boto3
 
-from config import (
-    BOTO_CONFIG,
-    CLIENT_ID,
-    REGION,
-    TEST_PW,
-    USER_COUNT,
-    USER_POOL_ID,
-    USER_PREFIX,
-)
+from config import BOTO_CONFIG, CLIENT_ID, REGION, TEST_PW, USER_COUNT, USER_POOL_ID, USER_PREFIX
 
 # adaptive retry가 적용된 클라이언트
 client = boto3.client("cognito-idp", region_name=REGION, config=BOTO_CONFIG)
@@ -32,9 +31,13 @@ client = boto3.client("cognito-idp", region_name=REGION, config=BOTO_CONFIG)
 # ==========================================
 # 1. 더미 유저 생성
 # ==========================================
-def create_dummy_users(count: int = USER_COUNT):
-    """지정한 수만큼 더미 유저를 생성하고 인증을 완료합니다."""
-    print(f"\n🚀 {count}명의 더미 유저 생성을 시작합니다...")
+def create_dummy_users(count: int = USER_COUNT, skip_verification: bool = True):
+    """
+    지정한 수만큼 더미 유저를 생성합니다.
+    skip_verification이 True이면 이메일 인증을 자동으로 완료 상태로 만들고 안내 메일을 차단합니다.
+    """
+    mode_text = "이메일 인증 스킵 모드" if skip_verification else "실제 이메일 인증(메일 발송) 모드"
+    print(f"\n🚀 {count}명의 더미 유저 생성을 시작합니다... [{mode_text}]")
 
     success_count = 0
     skipped_count = 0
@@ -44,16 +47,21 @@ def create_dummy_users(count: int = USER_COUNT):
     for i in range(1, count + 1):
         email = f"{USER_PREFIX}{i}@test.com"
         try:
-            # 1) 유저 생성 (이메일 인증 완료 상태, 알림 메일 차단)
-            client.admin_create_user(
-                UserPoolId=USER_POOL_ID,
-                Username=email,
-                UserAttributes=[
-                    {"Name": "email", "Value": email},
-                    {"Name": "email_verified", "Value": "true"},
-                ],
-                MessageAction="SUPPRESS",
-            )
+            # 1) 유저 생성 기본 설정
+            user_attributes = [{"Name": "email", "Value": email}]
+            create_kwargs = {
+                "UserPoolId": USER_POOL_ID,
+                "Username": email,
+            }
+
+            # 인증 스킵 설정이 켜져있으면 추가 속성 부여
+            if skip_verification:
+                user_attributes.append({"Name": "email_verified", "Value": "true"})
+                create_kwargs["MessageAction"] = "SUPPRESS"
+
+            create_kwargs["UserAttributes"] = user_attributes
+
+            client.admin_create_user(**create_kwargs)
 
             # 2) 비밀번호 영구 설정 (첫 로그인 Challenge 회피)
             client.admin_set_user_password(
@@ -108,8 +116,6 @@ def _collect_dummy_users() -> list[dict]:
         response = client.list_users(**kwargs)
 
         for user in response.get("Users", []):
-            # Cognito가 이메일 가입일 때 Username이 UUID로 변환되므로
-            # email 속성에서 우리 접두사를 확인합니다.
             email = ""
             for attr in user.get("Attributes", []):
                 if attr["Name"] == "email":
@@ -182,7 +188,12 @@ def main_menu():
         choice = input("명령을 선택하세요: ").strip()
 
         if choice == "1":
-            create_dummy_users(USER_COUNT)
+            # 이메일 인증 스킵 여부 선택 (기본값: 스킵)
+            skip_input = input("  📧 이메일 인증을 스킵하시겠습니까? (Y/n): ").strip().lower()
+            skip_verification = False if skip_input == "n" else True
+            
+            create_dummy_users(USER_COUNT, skip_verification)
+            
         elif choice == "2":
             targets = _collect_dummy_users()
             if not targets:
