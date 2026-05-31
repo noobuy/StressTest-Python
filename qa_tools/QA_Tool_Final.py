@@ -13,7 +13,7 @@ import sys
 
 from pathlib import Path
 
-# ★ 중요: 부모 폴더(루트)에 있는 config.py를 찾을 수 있게 경로 추가
+## ★ 중요: 부모 폴더(루트)에 있는 config.py를 찾을 수 있게 경로 추가
 _ROOT = str(Path(__file__).resolve().parent.parent)
 if _ROOT not in sys.path:
     sys.path.append(_ROOT)
