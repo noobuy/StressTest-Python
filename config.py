@@ -69,7 +69,7 @@ TOKENS_FILE = _ROOT_DIR / "load_test_tools" / "tokens.csv"
 # ------------------------------------------
 # CognitoAccountConfig.py, tokens.py 등에서 공용으로 사용합니다.
 # 사용법: boto3.client('cognito-idp', region_name=REGION, config=BOTO_CONFIG)
-
+#
 BOTO_CONFIG = BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"})
 
 # ------------------------------------------
