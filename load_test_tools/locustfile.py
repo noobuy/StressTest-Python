@@ -1,7 +1,11 @@
 # ==========================================
-# 🚀 Vamserlike 부하 테스트 엔진 (v2)
+# 🚀 Vamserlike 부하 테스트 엔진 (v3)
 # ==========================================
-# 개선 사항:
+# v2 → v3 변경점:
+#   - 신규 엔드포인트 PUT /api/players/me/characters/unlock 부하 태스크 추가
+#     (@tag("unlock"))
+#
+# 기존 개선 사항:
 #   1. 분산 모드(Worker) 안전한 토큰 분배 (Queue + 중복 방지)
 #   2. 토큰 만료(1h) 사전 경고 시스템
 #   3. 토큰 소진 시 유저를 즉시 중단 (통계 왜곡 방지)
@@ -19,25 +23,19 @@ import logging
 from queue import Queue, Empty
 from pathlib import Path
 
-# 👇 이 줄을 추가하세요!
 logger = logging.getLogger(__name__)
 
-# ★ 수정된 부분: 현재 폴더가 아니라 부모 폴더(루트)의 config.py를 찾도록 수정
+# ★ 부모 폴더(루트)의 config.py를 찾도록 경로 추가
 _ROOT = str(Path(__file__).resolve().parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from locust import HttpUser, task, between, tag, events
-from config import TOKENS_FILE, BASE_URL
+from config import TOKENS_FILE, BASE_URL, UNLOCK_TARGET_CHARACTER_ID
 
 # ==========================================
 # 1. 토큰 로딩 (Thread-safe Queue)
 # ==========================================
-# Queue는 greenlet/thread 환경 모두에서 안전합니다.
-# 분산 모드에서는 각 Worker가 독립된 Queue를 갖게 되므로
-# 토큰 파일을 Worker 수에 맞게 분할하거나,
-# Worker 인덱스 기반으로 슬라이싱합니다.
-
 TOKEN_QUEUE: Queue = Queue()
 TOKEN_LOAD_TIME: float = 0.0  # 토큰 파일의 수정 시각 (만료 경고용)
 TOKEN_EXPIRY_SECONDS = 3600   # Cognito IdToken 기본 만료: 1시간
@@ -54,7 +52,6 @@ def _load_tokens():
         )
         return 0
 
-    # 파일 수정 시각으로 만료 여부 추정
     TOKEN_LOAD_TIME = os.path.getmtime(TOKENS_FILE)
 
     count = 0
@@ -65,13 +62,11 @@ def _load_tokens():
             count += 1
 
     # ---- 분산 모드 토큰 슬라이싱 ----
-    # Locust 분산 실행 시 환경 변수로 Worker 분할을 지원합니다.
     # 사용법: WORKER_INDEX=0 WORKER_TOTAL=4 locust -f locustfile.py --worker
     worker_index = int(os.environ.get("WORKER_INDEX", "0"))
     worker_total = int(os.environ.get("WORKER_TOTAL", "1"))
 
     if worker_total > 1:
-        # Queue를 리스트로 꺼내서 이 Worker 몫만 다시 넣습니다.
         all_tokens = []
         while not TOKEN_QUEUE.empty():
             all_tokens.append(TOKEN_QUEUE.get())
@@ -127,7 +122,6 @@ def on_test_start(environment, **kwargs):
 # ==========================================
 # 3. 응답 시간 임계값 (ms)
 # ==========================================
-# 이 값을 초과하면 Locust에서 '실패'로 마킹합니다.
 RESPONSE_TIME_THRESHOLD_MS = int(os.environ.get("THRESHOLD_MS", "3000"))
 
 
@@ -146,8 +140,6 @@ class VamserlikePlayer(HttpUser):
         try:
             self.token = TOKEN_QUEUE.get_nowait()
         except Empty:
-            # 토큰이 모두 소진되면 이 유저는 즉시 종료합니다.
-            # 통계에 무의미한 0건 유저가 쌓이는 것을 방지합니다.
             logger.warning(
                 "⚠️  할당 가능한 토큰이 없습니다. "
                 "이 가상 유저는 테스트에 참여하지 않습니다."
@@ -170,8 +162,7 @@ class VamserlikePlayer(HttpUser):
             if resp.status_code in (200, 201, 204):
                 resp.success()
             elif resp.status_code == 409:
-                # 이미 init된 유저 → 정상 케이스
-                resp.success()
+                resp.success()  # 이미 init된 유저 → 정상
             else:
                 resp.failure(f"Init 실패: {resp.status_code} - {resp.text[:200]}")
 
@@ -229,7 +220,37 @@ class VamserlikePlayer(HttpUser):
             self._validate(resp, success_codes=(200, 204))
 
     # ---------------------------------------------------------
-    # 🏆 [기능 3] 랭킹 조회 (정렬/DB 과부하)
+    # 🎭 [기능 3] 캐릭터 해금 (쓰기 부하, 신규)
+    # ---------------------------------------------------------
+    # 부하 측정 목적상, 200(해금/이미보유)과 400(골드부족)은
+    # 모두 '서버가 정상 처리한 응답'으로 보고 실패로 집계하지 않습니다.
+    # 5xx / 타임아웃 / 임계 초과만 실패로 마킹합니다.
+    # (해금 엔드포인트의 순수 처리량·지연을 측정하기 위함)
+    @tag("unlock")
+    @task(1)
+    def unlock_character(self):
+        if not hasattr(self, "token"):
+            return
+        payload = {"characterId": UNLOCK_TARGET_CHARACTER_ID}
+        with self.client.put(
+            "/api/players/me/characters/unlock",
+            json=payload,
+            headers=self.headers,
+            catch_response=True,
+        ) as resp:
+            if resp.status_code in (200, 400):
+                if resp.elapsed.total_seconds() * 1000 > RESPONSE_TIME_THRESHOLD_MS:
+                    resp.failure(
+                        f"느린 응답: {resp.elapsed.total_seconds():.2f}s "
+                        f"(임계값: {RESPONSE_TIME_THRESHOLD_MS}ms)"
+                    )
+                else:
+                    resp.success()
+            else:
+                resp.failure(f"HTTP {resp.status_code} - {resp.text[:200]}")
+
+    # ---------------------------------------------------------
+    # 🏆 [기능 4] 랭킹 조회 (정렬/DB 과부하)
     # ---------------------------------------------------------
     @tag("ranking")
     @task(1)

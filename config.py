@@ -1,11 +1,12 @@
 # ==========================================
-# ⚙️ Vamserlike 테스트 툴 통합 설정 파일 (v2)
+# ⚙️ Vamserlike 테스트 툴 통합 설정 파일 (v3)
 # ==========================================
 # 개선 사항:
 #   1. 민감 정보를 .env 파일로 분리 (보안 강화)
 #   2. 환경 변수 우선 → .env 파일 → 기본값 순으로 폴백
-#   3. tokens.csv 경로를 스크립트 기준 절대경로로 고정
+#   3. tokens.csv 경로를 load_test_tools 폴더 기준 절대경로로 고정
 #   4. 환경(local/cloud) 전환을 ENV 변수 하나로 제어
+#   5. (v3) 캐릭터 해금 / Dev 리셋 설정 추가  ← QA 툴이 import 함
 # ==========================================
 
 import os
@@ -27,7 +28,7 @@ except ImportError:
 # ------------------------------------------
 # 1. 실행 환경 선택 (local / cloud)
 # ------------------------------------------
-# 터미널에서 전환: ENV=cloud python src/tokens.py
+# 터미널에서 전환: ENV=cloud python load_test_tools/tokens.py
 ENV = os.environ.get("ENV", "local")
 
 _URL_MAP = {
@@ -57,11 +58,24 @@ TABLE_NAME    = os.environ.get("TABLE_NAME",    "VamserlikeGame")
 PARTITION_KEY = os.environ.get("PARTITION_KEY",  "UserId")
 
 # ------------------------------------------
-# 5. 파일 경로 
+# 4-2. 캐릭터 해금 테스트 설정  (★ v3 복원)
+# ------------------------------------------
+# appsettings.json 의 GameOptions:CharacterUnlockCosts 에 등록된
+# '비용 1 이상'인 실제 캐릭터 ID 를 지정하세요. (비용 숫자는 코드가 자동 실측)
+UNLOCK_TARGET_CHARACTER_ID = os.environ.get("UNLOCK_TARGET_CHARACTER_ID", "rice_farmer")
+
+# ------------------------------------------
+# 4-3. Dev 리셋 확인 문구  (★ v3 복원)
+# ------------------------------------------
+# DevController 의 하드코딩 값과 반드시 일치해야 함
+RESET_CONFIRM_TEXT = os.environ.get("RESET_CONFIRM_TEXT", "DELETE_TEST_DATA")
+
+# ------------------------------------------
+# 5. 파일 경로
 # ------------------------------------------
 # config.py가 위치한 디렉토리를 기준으로 tokens.csv 경로를 고정합니다.
 _ROOT_DIR = Path(__file__).resolve().parent
-# 수정된 부분: tokens.csv를 무조건 load_test_tools 폴더 안에 넣습니다.
+# tokens.csv를 무조건 load_test_tools 폴더 안에 넣습니다.
 TOKENS_FILE = _ROOT_DIR / "load_test_tools" / "tokens.csv"
 
 # ------------------------------------------
@@ -69,7 +83,6 @@ TOKENS_FILE = _ROOT_DIR / "load_test_tools" / "tokens.csv"
 # ------------------------------------------
 # CognitoAccountConfig.py, tokens.py 등에서 공용으로 사용합니다.
 # 사용법: boto3.client('cognito-idp', region_name=REGION, config=BOTO_CONFIG)
-#
 BOTO_CONFIG = BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"})
 
 # ------------------------------------------
@@ -79,12 +92,14 @@ if __name__ == "__main__":
     print("=" * 50)
     print("⚙️  현재 적용된 설정값")
     print("=" * 50)
-    print(f"  ENV          : {ENV}")
-    print(f"  BASE_URL     : {BASE_URL}")
-    print(f"  REGION       : {REGION}")
-    print(f"  USER_POOL_ID : {USER_POOL_ID[:15]}... (마스킹)")
-    print(f"  CLIENT_ID    : {CLIENT_ID[:10]}... (마스킹)")
-    print(f"  USER_PREFIX  : {USER_PREFIX}")
-    print(f"  USER_COUNT   : {USER_COUNT}")
-    print(f"  TOKENS_FILE  : {TOKENS_FILE}")
+    print(f"  ENV                        : {ENV}")
+    print(f"  BASE_URL                   : {BASE_URL}")
+    print(f"  REGION                     : {REGION}")
+    print(f"  USER_POOL_ID               : {USER_POOL_ID[:15]}... (마스킹)")
+    print(f"  CLIENT_ID                  : {CLIENT_ID[:10]}... (마스킹)")
+    print(f"  USER_PREFIX                : {USER_PREFIX}")
+    print(f"  USER_COUNT                 : {USER_COUNT}")
+    print(f"  UNLOCK_TARGET_CHARACTER_ID : {UNLOCK_TARGET_CHARACTER_ID}")
+    print(f"  RESET_CONFIRM_TEXT         : {RESET_CONFIRM_TEXT}")
+    print(f"  TOKENS_FILE                : {TOKENS_FILE}")
     print("=" * 50)
