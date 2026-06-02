@@ -178,7 +178,7 @@ def delete_dummy_users():
 def main_menu():
     while True:
         print("\n" + "=" * 40)
-        print("👤 AWS Cognito 계정 관리자 (Jang Bros)")
+        print("👤 AWS Cognito 계정 관리자")
         print("=" * 40)
         print(f"  1. 부하 테스트용 유저 {USER_COUNT}명 생성")
         print("  2. 더미 유저 전체 삭제 (청소)")
