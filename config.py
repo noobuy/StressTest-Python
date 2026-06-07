@@ -33,7 +33,7 @@ ENV = os.environ.get("ENV", "local")
 
 _URL_MAP = {
     "local": "http://localhost:5159",
-    "cloud": os.environ.get("CLOUD_URL", "http://43.201.49.116:5159"),
+    "cloud": os.environ.get("CLOUD_URL", "http://43.201.20.218:5159"),
 }
 BASE_URL = _URL_MAP.get(ENV, _URL_MAP["local"])
 
@@ -41,28 +41,30 @@ BASE_URL = _URL_MAP.get(ENV, _URL_MAP["local"])
 # 2. AWS Cognito 설정 (민감 정보)
 # ------------------------------------------
 REGION       = os.environ.get("AWS_REGION",       "ap-northeast-2")
-USER_POOL_ID = os.environ.get("USER_POOL_ID",     "ap-northeast-2_mgNamTmpN")
-CLIENT_ID    = os.environ.get("COGNITO_CLIENT_ID", "4h53oqgo30ps6q2p3ao7b9d4kt")
+USER_POOL_ID = os.environ.get("USER_POOL_ID",     "ap-northeast-2_nvW6TzXwN")
+CLIENT_ID    = os.environ.get("COGNITO_CLIENT_ID", "78kvv0qos4gmvi29d26vf15bac")
 
 # ------------------------------------------
 # 3. 테스트용 공통 정보
 # ------------------------------------------
 TEST_PW     = os.environ.get("TEST_PW",     "Password123!")
 USER_PREFIX = os.environ.get("USER_PREFIX",  "loadtest_user_")
-USER_COUNT  = int(os.environ.get("USER_COUNT", "1000"))
+USER_COUNT  = int(os.environ.get("USER_COUNT", "20"))
 
 # ------------------------------------------
 # 4. DynamoDB 설정
 # ------------------------------------------
-TABLE_NAME    = os.environ.get("TABLE_NAME",    "VamserlikeGame")
-PARTITION_KEY = os.environ.get("PARTITION_KEY",  "UserId")
+#TABLE_NAME    = os.environ.get("TABLE_NAME",    "VamserlikeGame")
+#PARTITION_KEY = os.environ.get("PARTITION_KEY",  "UserId")
+# 정렬 키(Sort Key)에 대한 설정도 필요하다면 추가 (현재는 필수는 아님)
+#SORT_KEY      = "SK"
 
 # ------------------------------------------
 # 4-2. 캐릭터 해금 테스트 설정  (★ v3 복원)
 # ------------------------------------------
 # appsettings.json 의 GameOptions:CharacterUnlockCosts 에 등록된
 # '비용 1 이상'인 실제 캐릭터 ID 를 지정하세요. (비용 숫자는 코드가 자동 실측)
-UNLOCK_TARGET_CHARACTER_ID = os.environ.get("UNLOCK_TARGET_CHARACTER_ID", "rice_farmer")
+UNLOCK_TARGET_CHARACTER_ID = os.environ.get("UNLOCK_TARGET_CHARACTER_ID", "potato_farmer")
 
 # ------------------------------------------
 # 4-3. Dev 리셋 확인 문구  (★ v3 복원)

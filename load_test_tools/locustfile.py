@@ -263,3 +263,43 @@ class VamserlikePlayer(HttpUser):
             catch_response=True,
         ) as resp:
             self._validate(resp)
+
+# ---------------------------------------------------------
+    # 🚨 [기능 5] 클리어 치트(스피드핵) 방어 검증 (신규 추가)
+    # ---------------------------------------------------------
+    @tag("cheat")
+    @task(1)
+    def speedhack_cheat_test(self):
+        """0.1초 간격으로 연속 클리어 요청을 보냈을 때 서버가 막아내는지 테스트"""
+        if not hasattr(self, "token"):
+            return
+
+        payload = {
+            "score": 1500,
+            "level": 10,
+            "playedCharacterId": "rice_farmer",
+            "isClear": True
+        }
+
+        # 첫 번째 정상 클리어 요청 (성공해야 함)
+        self.client.put("/api/players/me/progress", json=payload, headers=self.headers)
+
+        # 치터처럼 대기 시간 없이 즉시(0.1초 후) 두 번째 클리어 요청 발송
+        time.sleep(0.1) 
+        
+        with self.client.put(
+            "/api/players/me/progress",
+            json=payload,
+            headers=self.headers,
+            catch_response=True,
+            name="/api/players/me/progress [Cheat Test]"
+        ) as resp:
+            # ⭐️ 치트 방어 검증 로직 ⭐️
+            if resp.status_code == 200 or resp.status_code == 204:
+                # 서버가 뚫림! 0.1초 만에 또 클리어됐는데 서버가 점수를 올려줌
+                resp.failure(f"🚨 서버 뚫림! 비정상 연속 클리어가 허용됨 (HTTP {resp.status_code})")
+            elif resp.status_code in (400, 403, 429):
+                # 서버가 치트를 감지하고 튕겨냄 (성공적으로 방어함)
+                resp.success()
+            else:
+                resp.failure(f"예상치 못한 응답: {resp.status_code}")
