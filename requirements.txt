@@ -1,3 +1,4 @@
-requests
+requests[socks]
 boto3
 locust
+python-dotenv
