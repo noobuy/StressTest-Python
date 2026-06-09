@@ -38,6 +38,7 @@ if _ROOT not in sys.path:
 
 import time
 from dataclasses import dataclass, field
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
@@ -472,6 +473,7 @@ RATE_BURST = int(os.environ.get("RATE_BURST", "150"))
 RATE_POLL_SECONDS = int(os.environ.get("RATE_POLL_SECONDS", "120"))
 RATE_PROBE_INTERVAL = 5
 RATE_REQ_TIMEOUT = int(os.environ.get("RATE_REQ_TIMEOUT", "5"))  # 죽은 백엔드에서 버스트가 느려지지 않게
+RATE_WORKERS = int(os.environ.get("RATE_WORKERS", "1"))  # 1=단일 연결(같은 IP 보장, 권장). >1=병렬(단일 공인 IP 망에서만)
 
 
 def _rule_label(rule):
@@ -571,30 +573,65 @@ def send_parallel_any_blocked(method, path, count, *, headers=None, json_body=No
 
 
 def rate_test(method, path, *, headers=None, json_body=None):
-    """버스트로 한도를 초과시킨 뒤, WAF 평가 지연(약 30초+)을 고려해
-    차단(403)이 나타날 때까지 폴링한다. 반환: (blocked, rule, info)
+    """버스트를 '단일 keep-alive 연결'로 순차 전송한다(RATE_WORKERS<=1, 기본값).
+    이렇게 하면 모든 요청이 같은 출발 IP에서 나가, NAT 풀/CGNAT 환경에서도 WAF의
+    'IP별 5분 100건' 카운트가 정상 누적된다. 401처럼 빠른 응답이면 수십 초면 한도 초과.
+    RATE_WORKERS>1로 설정하면 병렬 전송(단일 공인 IP 망에서 더 빠르게).
+    반환: (blocked, rule, info)"""
 
-    백엔드가 죽어 5xx를 연속으로 돌려주면(=요청이 느려지고 rate 윈도우에
-    100건이 안 쌓임) 일찍 중단해 오래 매달리지 않는다."""
     responded = 0
     server_errors = 0
-    for i in range(RATE_BURST):
-        try:
-            resp = requests.request(method, f"{WAF_TARGET_URL}{path}",
-                                    headers=headers, json=json_body, timeout=RATE_REQ_TIMEOUT)
-            responded += 1
-            if resp.status_code == WAF_BLOCK_CODE:
-                return True, resp.headers.get(BLOCK_HEADER), f"버스트 {RATE_BURST}건 중 차단"
-            if resp.status_code >= 500:
-                server_errors += 1
-            if i >= 9 and server_errors == responded:
-                return False, None, "백엔드 5xx 연속 — 속도 검증 불가(백엔드 점검 필요)"
-        except Exception:
-            pass
+    blocked = False
+    block_rule = None
+    codes = Counter()
+
+    def _account(code, rule):
+        nonlocal responded, server_errors, blocked, block_rule
+        if code is None:
+            return
+        responded += 1
+        codes[code] += 1
+        if code == WAF_BLOCK_CODE:
+            blocked = True
+            block_rule = rule or block_rule
+        elif code >= 500:
+            server_errors += 1
+
+    if RATE_WORKERS <= 1:
+        # 단일 연결(keep-alive) 순차 — 같은 출발 IP 보장
+        sess = requests.Session()
+        for _ in range(RATE_BURST):
+            try:
+                r = sess.request(method, f"{WAF_TARGET_URL}{path}",
+                                 headers=headers, json=json_body, timeout=RATE_REQ_TIMEOUT)
+                _account(r.status_code, r.headers.get(BLOCK_HEADER))
+            except Exception:
+                pass
+        sess.close()
+    else:
+        def _one(_):
+            try:
+                r = requests.request(method, f"{WAF_TARGET_URL}{path}",
+                                     headers=headers, json=json_body, timeout=RATE_REQ_TIMEOUT)
+                return r.status_code, r.headers.get(BLOCK_HEADER)
+            except Exception:
+                return None, None
+        with ThreadPoolExecutor(max_workers=RATE_WORKERS) as ex:
+            for code, rule in ex.map(_one, range(RATE_BURST)):
+                _account(code, rule)
+
+    failed = RATE_BURST - responded
+    print(f"            │ … 버스트 {RATE_BURST}건: 응답 {responded}, 실패 {failed}, 상태 {dict(codes)}")
+
+    if blocked:
+        return True, block_rule, f"버스트 {RATE_BURST}건 중 차단"
     if responded == 0:
         return False, None, "대상에 연결 불가 — 폴링 생략"
+    if responded < RATE_BURST * 0.5:
+        return False, None, f"응답 {responded}/{RATE_BURST} — 요청 상당수 실패(네트워크 점검), 폴링 생략"
     if server_errors >= responded * 0.8:
         return False, None, f"응답 대부분이 5xx({server_errors}/{responded}) — 백엔드 점검 필요, 폴링 생략"
+
     print(f"            │ … 버스트 {RATE_BURST}건 완료, 최대 {RATE_POLL_SECONDS}초 폴링 중")
     deadline = time.time() + RATE_POLL_SECONDS
     while time.time() < deadline:
@@ -782,6 +819,30 @@ def case_10_known_bad_inputs(report):
     report.record("Case 10. 알려진 악성 입력 차단", "PASS" if all_blocked else "FAIL")
 
 
+def _egress_ip_probe(n=12):
+    """동시 연결의 '출발 공인 IP'를 여러 번 확인해 NAT 풀(다중 IP) 여부를 감지한다.
+    속도 규칙은 IP별 카운트라, 출발 IP가 여러 개면 카운트가 안 차 미차단(오탐)이 난다.
+    반환: 확인된 공인 IP 집합 (확인 실패 시 빈 집합)."""
+    endpoints = ["https://checkip.amazonaws.com", "https://api.ipify.org"]
+
+    def _ip(i):
+        try:
+            r = requests.get(endpoints[i % len(endpoints)], timeout=5)
+            return r.text.strip()
+        except Exception:
+            return None
+
+    ips = set()
+    try:
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            for ip in ex.map(_ip, range(n)):
+                if ip:
+                    ips.add(ip)
+    except Exception:
+        pass
+    return ips
+
+
 def _waf_preflight_check():
     """대상(WAF_TARGET_URL)에 연결 가능한지 먼저 확인. 연결 자체가 안 되면 중단.
     백엔드 헬스체크가 5xx면(=ALB 뒤 백엔드 비정상) 경고만 하고 진행한다."""
@@ -815,6 +876,26 @@ def _waf_run_all() -> bool:
 
     if not _waf_preflight_check():
         return False
+
+    _sys_proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                  or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+                  or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy"))
+    if _sys_proxy:
+        print(f"\n⚠️  시스템 프록시 감지: {_sys_proxy}")
+        print("    requests의 모든 요청이 이 프록시를 거쳐, 출발 IP가 프록시(풀)로 보입니다.")
+        print("    속도(rate) 케이스는 '동일 IP 5분 100건' 기준이라, 프록시 풀이면 카운트가")
+        print("    안 차서 미차단(오탐)이 납니다. 속도 케이스는 프록시 없는 단일 공인망")
+        print("    (폰 핫스팟/집/EC2)에서 실행을 권장합니다.")
+
+    egress = _egress_ip_probe()
+    if len(egress) > 1:
+        print(f"\n⚠️  출발 공인 IP가 여러 개로 보입니다: {sorted(egress)}")
+        print("    이 네트워크는 NAT 풀/CGNAT일 수 있습니다. WAF 속도 규칙은 '동일 IP 5분 100건'")
+        print("    기준이라, IP가 분산되면 카운트가 안 차서 속도 케이스가 미차단(오탐)이 됩니다.")
+        print("    → 속도(2/3/6/7) 케이스는 단일 공인 IP 망(집/폰 핫스팟/EC2)에서 실행하세요.")
+        print("    (나머지 케이스는 이 네트워크에서도 정상 검증됩니다.)")
+    elif len(egress) == 1:
+        print(f"ℹ️  출발 공인 IP: {next(iter(egress))} (단일 — 속도 규칙 검증에 적합)")
 
     report = WafReport()
     token = get_token()
